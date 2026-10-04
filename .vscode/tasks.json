@@ -1,0 +1,45 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "cmake",
+            "label": "CMake: build",
+            "command": "build",
+            "targets": [
+                "all"
+            ],
+            "preset": "${command:cmake.activeBuildPresetName}",
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "CMake template build task"
+        },
+        {
+            "type": "cmake",
+            "label": "CMake: 生成",
+            "command": "build",
+            "targets": [
+                "all"
+            ],
+            "preset": "${command:cmake.activeBuildPresetName}",
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "CMake template build task"
+        },
+        {
+            "label": "Flash (OpenOCD DAP)",
+            "type": "shell",
+            "command": "D:/OpenOCD-20250710-0.12.0/bin/openocd.exe",
+            "args": [
+                "-f", "interface/cmsis-dap.cfg",
+                "-f", "target/stm32f4x.cfg",
+                "-c", "program D:/Desktop/ROBOT_FIRST/build/Debug/ROBOT_FIRST.elf verify reset exit"
+            ],
+            "dependsOn": "CMake: build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}
