@@ -21,6 +21,7 @@
 #include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
+#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -28,6 +29,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "robot.hpp"
+#include "bsp_delay.hpp"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,14 +99,16 @@ int main(void)
   MX_TIM1_Init();
   MX_USART3_UART_Init();
   MX_CAN2_Init();
+  MX_SPI1_Init();
+  MX_TIM10_Init();
   /* USER CODE BEGIN 2 */
   /*
    * Robot_Init starts CAN reception, the remote-control DMA receiver, and
    * the three servo PWM channels.  Start the control timer only after those
    * peripherals are ready, so Robot_Task cannot run against partial state.
    */
+  delay_init();
   Robot_Init();
-
   /* USER CODE END 2 */
 
   /* Init scheduler */

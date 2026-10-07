@@ -21,7 +21,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
-#include "cmsis_os.h"
+#include "cmsis_os2.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -58,7 +58,7 @@ const osThreadAttr_t defaultTask_attributes = {
 osThreadId_t RobotTaskHandle;
 const osThreadAttr_t RobotTask_attributes = {
   .name = "RobotTask",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
 
@@ -107,6 +107,11 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  if (RobotTaskHandle == NULL)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -146,15 +151,31 @@ void StartRobotTask(void *argument)
   /* USER CODE BEGIN StartRobotTask */
   (void)argument;
 
+  const uint32_t tickHz = osKernelGetTickFreq();
+
+  /* 将2 ms转换成RTOS tick，向上取整 */
+  uint32_t periodTicks =
+      (uint32_t)(((uint64_t)2U * tickHz + 999U) / 1000U);
+
+  if (periodTicks == 0U)
+  {
+      periodTicks = 1U;
+  }
+
   uint32_t nextWake = osKernelGetTickCount();
   /* Infinite loop */
   for(;;)
   {
     Robot_Task();
-    nextWake += 2U;  /* RTOS Tick 为 1 ms 时，周期为 2 ms */
+    nextWake += periodTicks;
 
     if (osDelayUntil(nextWake) != osOK)
     {
+        /*
+          * 周期超时时也必须阻塞，
+          * 避免一直占用CPU。
+          */
+        osDelay(1U);
         nextWake = osKernelGetTickCount();
     }
   }
