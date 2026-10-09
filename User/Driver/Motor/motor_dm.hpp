@@ -1,9 +1,6 @@
 /**
  * @file    motor_dm.hpp
  * @brief   达妙电机驱动模块（DM4310 MIT模式）C++接口
- *
- * MIT帧格式：pos(16)|vel(12)|kp(12)|kd(12)|tor(12)
- * 使用CAN2，每台电机独立发送
  */
 
 #pragma once
@@ -13,7 +10,6 @@
 
 namespace Robot
 {
-
     /* ======================== 常量 ======================== */
 
     inline constexpr uint8_t kDmMotorCount = 2U;
@@ -24,15 +20,12 @@ namespace Robot
     inline constexpr float kDm4310PosMaxRad = 12.5f;
     inline constexpr float kDm4310VelMaxRadPerS = 30.0f;
     inline constexpr float kDm4310TorqueMax = 10.0f;
-    // 转换系数
     inline constexpr float kDmRadToDeg = 57.2957795131f;
     inline constexpr float kDmDegToRad = 0.0174532925199f;
-
     inline constexpr float kDm4310KpMax = 500.0f;
     inline constexpr float kDm4310KdMax = 5.0f;
 
     inline constexpr uint32_t kDmOfflineTimeoutMs = 200U;
-
     inline constexpr uint32_t kDmJointLeftTxCanId = 0x001U;
     inline constexpr uint32_t kDmJointLeftRxCanId = 0x010U;
     inline constexpr uint32_t kDmJointRightTxCanId = 0x002U;
@@ -57,15 +50,27 @@ namespace Robot
         float torque = 0.0f;
     };
 
+    /* ======================== MIT 编码帧 ======================== */
+
+    /**
+     * @brief 已编码的 DM MIT 控制帧，可直接传给 BspCanSendStdFrame。
+     */
+    struct DmMitFrame
+    {
+        uint32_t canId = 0U;
+        uint8_t data[8] = {};
+        bool valid = false; ///< false 表示编码失败，不应发送
+    };
+
     /* ======================== 单电机实例 ======================== */
 
     class DmMotorInstance
     {
     public:
         DmMotorInstance() = default;
-        void init(uint32_t txCanId, uint32_t rxCanId, float kp, float kd);
+        void init(uint32_t txCanId, uint32_t rxCanId,
+                  float kp, float kd);
 
-        // MIT目标
         float targetAngleDeg = 0.0f;
         float targetVelDegPerS = 0.0f;
         float targetTorque = 0.0f;
@@ -115,9 +120,18 @@ namespace Robot
                           float kp,
                           float kd);
 
+        /**
+         * @brief 将当前 MIT 目标编码为帧，不发送。
+         *        frame.valid = false 时不应调用 BspCanSendStdFrame。
+         */
+        bool buildMitFrame(DmIndex idx, DmMitFrame &frame) const;
+
+        /// 兼容接口：内部调用 buildMitFrame 后发送，迁移完成后删除
         bool sendMitCommand(DmIndex idx);
 
-        void updateFeedback(uint32_t canId, const uint8_t *pData, uint8_t dlc);
+        void updateFeedback(uint32_t canId,
+                            const uint8_t *pData,
+                            uint8_t dlc);
         void updateOnlineStatus();
 
         const DmMotorInstance *getInstance(DmIndex idx) const;
@@ -134,7 +148,8 @@ namespace Robot
                           const uint8_t *pData,
                           uint8_t len);
 
-        bool sendSpecialCmd(uint8_t motorCanId, uint8_t cmd);
+        // 参数改为 uint32_t，避免大于 0xFF 的 CAN ID 被截断
+        bool sendSpecialCmd(uint32_t motorCanId, uint8_t cmd);
 
         DmMotorInstance *getMotor(DmIndex idx);
     };

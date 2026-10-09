@@ -1,5 +1,12 @@
+/**
+ * @file    manipulator.cpp
+ * @brief   机械臂相关函数实现
+ *          包含：关节/Yaw/升降/舵机的解算与输出计算
+ *          通信函数（CAN/UART）均在 communication.cpp
+ */
 #include "manipulator.hpp"
-
+#include "robot.hpp"
+#include "main.h"
 #include "debug.hpp"
 
 #include <cmath>
@@ -7,7 +14,12 @@
 namespace Robot
 {
 
-void RobotController::resolveLeftStickAxis()
+    /* ================================================================
+     * resolveLeftStickAxis
+     * Grab 模式下对左摇杆 V/H 轴做单轴仲裁：
+     * 绝对值较大的轴独占，另一轴清零，防止升降和 Yaw 同时运动。
+     * ================================================================ */
+    void RobotController::resolveLeftStickAxis()
     {
         if (state_ != RobotState::Grab)
         {
@@ -17,10 +29,10 @@ void RobotController::resolveLeftStickAxis()
         }
 
         const RemoteData &rc = remote_.data();
+
         float v = applyDeadband(rc.leftV, kJoystickDeadband);
         float h = applyDeadband(rc.leftH, kJoystickDeadband);
 
-        // 绝对值大的轴主导，另一轴清零
         if (fabsf(v) >= fabsf(h))
         {
             grabLeftVArb_ = v;
@@ -33,176 +45,157 @@ void RobotController::resolveLeftStickAxis()
         }
     }
 
-void RobotController::resolveJointCmd()
+    /* ================================================================
+     * resolveJointCmd
+     * ================================================================ */
+    void RobotController::resolveJointCmd()
     {
-        /* 默认没有关节速度前馈，Stair分支按需要覆盖 */
-        jointCmd_.velDegPerS = 0.0f;
         if (state_ == RobotState::Stair)
         {
             const RemoteData &rc = remote_.data();
-            float input = applyDeadband(rc.leftV, kJoystickDeadband);
-            debugLeftV = rc.leftV;
+            float leftV = applyDeadband(rc.leftV, kJoystickDeadband);
 
-            // 按时间累积目标角度
-            dmTargetDeg_ += input * kJointRateDegPerSec * kTaskPeriodS;
+            dmTargetDeg_ += leftV * kJointRateDegPerSec * kTaskPeriodS;
             dmTargetDeg_ = clampF(dmTargetDeg_, kJointMinDeg, kJointMaxDeg);
-            debugDmTargetDeg = dmTargetDeg_;
 
             jointCmd_.leftDeg = dmTargetDeg_;
             jointCmd_.rightDeg = dmTargetDeg_;
-            jointCmd_.velDegPerS = input * kJointRateDegPerSec * 0.15f;
+            jointCmd_.velDegPerS = 0.0f;
             jointCmd_.kp = kJointKp;
             jointCmd_.kd = kJointKd;
         }
-        else if (state_ == RobotState::Standby)
-        {
-            // Standby：目标锁定在进入时冻结的 dmTargetDeg_，kp>0 提供静态保持力抵抗重力
-            jointCmd_.leftDeg = dmTargetDeg_;
-            jointCmd_.rightDeg = dmTargetDeg_;
-            jointCmd_.kp = kJointFoldKp;
-            jointCmd_.kd = kJointFoldKd;
-        }
         else
         {
-            // Drive / Grab：跟踪实际位置，目标误差为零，小 kp 提供保持力
-            const DmMotorInstance *mL = joint_.getInstance(DmIndex::Left);
-            const DmMotorInstance *mR = joint_.getInstance(DmIndex::Right);
-            if (mL != nullptr && mL->isOnline())
-                dmTargetDeg_ = mL->feedback().angleDeg;
-            jointCmd_.leftDeg = (mL != nullptr && mL->isOnline()) ? mL->feedback().angleDeg : dmTargetDeg_;
-            jointCmd_.rightDeg = (mR != nullptr && mR->isOnline()) ? mR->feedback().angleDeg : dmTargetDeg_;
+            // 非 Stair：回到收起位
+            jointCmd_.leftDeg = kJointFoldDeg;
+            jointCmd_.rightDeg = kJointFoldDeg;
+            jointCmd_.velDegPerS = 0.0f;
             jointCmd_.kp = kJointFoldKp;
             jointCmd_.kd = kJointFoldKd;
         }
     }
 
-void RobotController::resolveYawCmd()
+    /* ================================================================
+     * resolveYawCmd
+     * ================================================================ */
+    void RobotController::resolveYawCmd()
     {
         if (state_ != RobotState::Grab)
             return;
-        if (!yaw_.isOnline())
-            return;
 
-        float yawInput = grabLeftHArb_;
-
-        targetYawDeg_ += yawInput * kYawStepDeg;
+        targetYawDeg_ += grabLeftHArb_ * kYawStepDeg;
         targetYawDeg_ = clampF(targetYawDeg_, -kYawMaxDeg, kYawMaxDeg);
     }
 
-void RobotController::resolveLiftCmd()
+    /* ================================================================
+     * resolveLiftCmd
+     * ================================================================ */
+    void RobotController::resolveLiftCmd()
     {
-        if (state_ == RobotState::Grab)
-        {
-            lift_.updateTargetByJoystick(grabLeftVArb_, kTaskPeriodS);
-        }
-        // 其余模式不调用 updateTargetByJoystick，目标保持不变
+        if (state_ != RobotState::Grab)
+            return;
+
+        lift_.updateTargetByJoystick(grabLeftVArb_, kTaskPeriodS);
     }
 
-void RobotController::resolveServoCmd()
+    /* ================================================================
+     * resolveServoCmd
+     * ================================================================ */
+    void RobotController::resolveServoCmd()
     {
+        if (state_ != RobotState::Grab)
+            return;
+
         const RemoteData &rc = remote_.data();
 
-        if (state_ == RobotState::Grab)
+        float dial = applyDeadband(rc.dial, kDialGripperThresh);
+
+        if (dial > 0.0f)
         {
-            // 拨轮阈值切换夹爪
-            if (rc.dial > kDialGripperThresh)
-            {
-                gripperState_ = GripperState::Closed;
-                servoCmd_.gripperUs = kGripperCloseUs;
-            }
-            else if (rc.dial < -kDialGripperThresh)
-            {
-                gripperState_ = GripperState::Open;
-                servoCmd_.gripperUs = kGripperOpenUs;
-            }
+            gripperState_ = GripperState::Closed;
+            servoCmd_.gripperUs = kGripperCloseUs;
         }
-        // 非 Grab 模式夹爪保持上次状态，不强制复位
+        else if (dial < 0.0f)
+        {
+            gripperState_ = GripperState::Open;
+            servoCmd_.gripperUs = kGripperOpenUs;
+        }
+        // dial == 0：保持上一次状态不变
     }
 
-void RobotController::applyJointMotors()
+    /* ================================================================
+     * applyJointMotors
+     * 只计算 MIT 目标，不发送 CAN（由 sendMotorCommands 统一发送）
+     * ================================================================ */
+    void RobotController::applyJointMotors()
     {
-        // 刷新 DM 调试变量
-        const DmMotorInstance *mL = joint_.getInstance(DmIndex::Left);
-        const DmMotorInstance *mR = joint_.getInstance(DmIndex::Right);
-        if (mL != nullptr)
-        {
-            debugDmLeftOnline = mL->isOnline() ? 1U : 0U;
-            debugDmLeftError = mL->feedback().errorCode;
-            debugDmLeftAngleDeg = mL->feedback().angleDeg;
-            debugDmLeftVelDps = mL->feedback().velocityDegPerS;
-            debugDmLeftTorque = mL->feedback().torque;
-            debugDmLeftTargetDeg = jointCmd_.leftDeg;
-        }
-        if (mR != nullptr)
-        {
-            debugDmRightOnline = mR->isOnline() ? 1U : 0U;
-            debugDmRightError = mR->feedback().errorCode;
-            debugDmRightAngleDeg = mR->feedback().angleDeg;
-            debugDmRightVelDps = mR->feedback().velocityDegPerS;
-            debugDmRightTorque = mR->feedback().torque;
-            debugDmRightTargetDeg = jointCmd_.rightDeg;
-        }
+        joint_.setMitTarget(
+            DmIndex::Left,
+            jointCmd_.leftDeg,
+            jointCmd_.velDegPerS,
+            0.0f,
+            jointCmd_.kp,
+            jointCmd_.kd);
 
-        joint_.setMitTarget(DmIndex::Left,
-                            jointCmd_.leftDeg,
-                            jointCmd_.velDegPerS, 0.0f,
-                            jointCmd_.kp, jointCmd_.kd);
-
-        joint_.setMitTarget(DmIndex::Right,
-                            jointCmd_.rightDeg,
-                            jointCmd_.velDegPerS, 0.0f,
-                            jointCmd_.kp, jointCmd_.kd);
-
-        joint_.sendMitCommand(DmIndex::Left);
-        joint_.sendMitCommand(DmIndex::Right);
+        joint_.setMitTarget(
+            DmIndex::Right,
+            jointCmd_.rightDeg,
+            jointCmd_.velDegPerS,
+            0.0f,
+            jointCmd_.kp,
+            jointCmd_.kd);
     }
 
-void RobotController::applyYawMotor()
+    /* ================================================================
+     * applyYawMotor
+     * 只计算输出，不发送 CAN（由 sendMotorCommands 统一发送）
+     * ================================================================ */
+    void RobotController::applyYawMotor()
     {
-        if (state_ == RobotState::Standby)
-        {
-            yaw_.syncTargetToCurrent();
-            targetYawDeg_ = yaw_.currentAngleDeg();
-            yaw_.sendZeroCurrent();
-            return;
-        }
-
-        if (!yaw_.isOnline())
-        {
-            yaw_.sendZeroCurrent();
-            return;
-        }
-
-        // 仅 Grab 模式才更新目标并运行闭环；其余模式锁定当前位置
-        if (state_ == RobotState::Grab)
+        if (state_ == RobotState::Grab && yaw_.isOnline())
         {
             yaw_.setTargetAngleDeg(targetYawDeg_);
-            yaw_.sendCurrent();
+            yaw_.calcOutput();
+            return;
         }
-        else
-        {
-            // Drive / Stair：保持目标=当前角度，输出零或极小电流
-            yaw_.syncTargetToCurrent();
-            targetYawDeg_ = yaw_.currentAngleDeg();
-            yaw_.sendZeroCurrent();
-        }
+
+        // 非 Grab：同步目标到当前，清零输出
+        yaw_.syncTargetToCurrent();
+        targetYawDeg_ = yaw_.currentAngleDeg();
+        yaw_.clearOutput();
     }
 
-void RobotController::applyLiftMotor()
+    /* ================================================================
+     * applyLiftMotor
+     * 只计算输出，不发送 CAN（由 sendMotorCommands 统一发送）
+     * ================================================================ */
+    void RobotController::applyLiftMotor()
     {
-        // 升降电机的 CAN 帧已在 applyChassisMotors() 内与副履带合并发送
-        // 此函数保留供后续扩展（如独立发送、状态检查等）
+        lift_.calcOutput();
     }
 
-void RobotController::applyServos()
+    /* ================================================================
+     * applyServos
+     * PWM 直接写寄存器，不经过 CAN
+     * ================================================================ */
+    void RobotController::applyServos()
     {
         setServoPulse(kServoFoldCh, servoCmd_.foldUs);
         setServoPulse(kServoGripperCh, servoCmd_.gripperUs);
     }
 
-void RobotController::setServoPulse(uint32_t channel, uint32_t pulseUs)
+    /* ================================================================
+     * setServoPulse
+     * ================================================================ */
+    void RobotController::setServoPulse(uint32_t channel, uint32_t pulseUs)
     {
         pulseUs = clampPulse(pulseUs, kServoPwmMinUs, kServoPwmMaxUs);
+
+        // 只在值变化时才写寄存器，避免每周期重复写入产生毛刺
+        const uint32_t current = __HAL_TIM_GET_COMPARE(htim1_, channel);
+        if (current == pulseUs)
+            return;
+
         __HAL_TIM_SET_COMPARE(htim1_, channel, pulseUs);
     }
 

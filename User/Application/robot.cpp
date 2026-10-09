@@ -16,7 +16,7 @@ extern "C"
 namespace Robot
 {
 
-void RobotController::init()
+    void RobotController::init()
     {
         Imu_Init();
         hcan1_ = &hcan1;
@@ -66,7 +66,7 @@ void RobotController::init()
         prevState_ = RobotState::Standby;
     }
 
-void RobotController::task()
+    void RobotController::task()
     {
         ++debugTaskCount;
 
@@ -77,8 +77,7 @@ void RobotController::task()
         checkOnlineStatus();
 
         debugNowMs = HAL_GetTick();
-        debugRemoteAgeMs =
-            debugNowMs - remote_.data().lastUpdateMs;
+        debugRemoteAgeMs = debugNowMs - remote_.data().lastUpdateMs;
 
         debugRemoteOnline = remoteOnline_ ? 1U : 0U;
         debugRemoteLastUpdateMs = remote_.data().lastUpdateMs;
@@ -90,10 +89,8 @@ void RobotController::task()
         {
             faultStop();
 
-            debugRobotState =
-                static_cast<uint8_t>(state_);
+            debugRobotState = static_cast<uint8_t>(state_);
 
-            /* 避免调试界面显示上一次的辅助激活状态 */
             debugBmiYawRateDps = bmi_yaw_rate_dps;
             debugBmiStraightCorrectionRpm = 0.0f;
             debugBmiStraightActive = 0U;
@@ -101,12 +98,8 @@ void RobotController::task()
             return;
         }
 
-        debugSwitchRightRaw =
-            static_cast<uint8_t>(remote_.data().switchRight);
-
-        debugSwitchLeftRaw =
-            static_cast<uint8_t>(remote_.data().switchLeft);
-
+        debugSwitchRightRaw = static_cast<uint8_t>(remote_.data().switchRight);
+        debugSwitchLeftRaw = static_cast<uint8_t>(remote_.data().switchLeft);
         debugRightV = remote_.data().rightV;
 
         RobotState oldState = state_;
@@ -120,8 +113,7 @@ void RobotController::task()
 
         prevState_ = oldState;
 
-        debugRobotState =
-            static_cast<uint8_t>(state_);
+        debugRobotState = static_cast<uint8_t>(state_);
 
         /* =========================================================
          * 3. 解算各机构目标
@@ -137,37 +129,43 @@ void RobotController::task()
         resolveServoCmd();
 
         /* =========================================================
-         * 4. 计算并发送输出
+         * 4. 计算各机构输出（仅计算，不发送 CAN）
          * ========================================================= */
         applyChassisMotors();
         applyJointMotors();
         applyYawMotor();
         applyLiftMotor();
+
+        /* =========================================================
+         * 5. 统一组帧发送所有电机命令
+         * ========================================================= */
+        sendMotorCommands();
+
+        /* =========================================================
+         * 6. 舵机输出（PWM，不经过 CAN）
+         * ========================================================= */
         applyServos();
     }
 
-void RobotController::onStateEnter(RobotState newState)
+    void RobotController::onStateEnter(RobotState newState)
     {
         switch (newState)
         {
         case RobotState::Stair:
-            // 进入爬楼：从当前反馈角度接管 DM 目标，避免突变
-            {
-                const DmMotorInstance *mL = joint_.getInstance(DmIndex::Left);
-                if (mL != nullptr && mL->isOnline())
-                    dmTargetDeg_ = mL->feedback().angleDeg;
-                else
-                    dmTargetDeg_ = kJointFoldDeg;
-            }
-            break;
+        {
+            const DmMotorInstance *mL = joint_.getInstance(DmIndex::Left);
+            if (mL != nullptr && mL->isOnline())
+                dmTargetDeg_ = mL->feedback().angleDeg;
+            else
+                dmTargetDeg_ = kJointFoldDeg;
+        }
+        break;
 
         case RobotState::Grab:
             // 进入抓取：同步升降目标到当前位置，折叠舵机展开
             lift_.syncTargetToCurrent();
-            // 仅当升降在安全高度时才展开；否则程序仍展开但应加机械互锁
             servoCmd_.foldUs = kFoldDeployUs;
             foldState_ = FoldState::Deployed;
-            // 同步 Yaw 目标，防止模式切换时跳变
             if (yaw_.isOnline())
             {
                 targetYawDeg_ = yaw_.currentAngleDeg();
@@ -177,17 +175,8 @@ void RobotController::onStateEnter(RobotState newState)
 
         case RobotState::Standby:
         case RobotState::Drive:
-            // 离开 Grab → 收起折叠舵机
-            // 注意：理想情况下应先等升降回安全高度；
-            // 此处简化为直接发收起指令，建议加到位开关后改为状态机等待。
-            if (foldState_ == FoldState::Deployed)
-            {
-                servoCmd_.foldUs = kFoldFlatUs;
-                foldState_ = FoldState::Folded;
-            }
-            // DM 回到收起位
+            // 折叠舵机仅由左拨杆切入/切出 Grab 驱动（见 updateStateMachine）
             dmTargetDeg_ = kJointFoldDeg;
-            // Yaw 不再接受新增量，锁定当前位置
             if (yaw_.isOnline())
             {
                 targetYawDeg_ = yaw_.currentAngleDeg();
@@ -200,11 +189,10 @@ void RobotController::onStateEnter(RobotState newState)
         }
     }
 
-void RobotController::updateStateMachine()
+    void RobotController::updateStateMachine()
     {
         const RemoteData &rc = remote_.data();
 
-        // 右拨杆 Up：Standby，清除 Grab 请求
         if (rc.switchRight == SwitchPos::Up)
         {
             state_ = RobotState::Standby;
@@ -213,20 +201,24 @@ void RobotController::updateStateMachine()
             return;
         }
 
-        // 左拨杆边沿检测：从非 Down → Down 才置请求
         if (rc.switchLeft == SwitchPos::Down &&
             prevSwitchLeft_ != SwitchPos::Down)
         {
             grabRequested_ = true;
         }
-        // 左拨杆离开 Down 时清除请求
         if (rc.switchLeft != SwitchPos::Down)
         {
+            // 左拨杆切出 Grab：收起折叠舵机（Standby 已在上方提前返回，不动）
+            if (prevSwitchLeft_ == SwitchPos::Down &&
+                foldState_ == FoldState::Deployed)
+            {
+                servoCmd_.foldUs = kFoldFlatUs;
+                foldState_ = FoldState::Folded;
+            }
             grabRequested_ = false;
         }
         prevSwitchLeft_ = rc.switchLeft;
 
-        // 按右拨杆设置基础状态
         switch (rc.switchRight)
         {
         case SwitchPos::Mid:
@@ -240,14 +232,13 @@ void RobotController::updateStateMachine()
             break;
         }
 
-        // Grab 请求覆盖（不覆盖 Standby）
         if (grabRequested_)
         {
             state_ = RobotState::Grab;
         }
     }
 
-void RobotController::checkOnlineStatus()
+    void RobotController::checkOnlineStatus()
     {
         remote_.updateOnlineStatus();
         chassis_.updateOnlineStatus();
@@ -260,34 +251,24 @@ void RobotController::checkOnlineStatus()
         motorAllOnline_ = chassis_.isAllOnline();
     }
 
-void RobotController::faultStop()
+    void RobotController::faultStop()
     {
-        // 主履带清零
-        chassis_.setTargetSpeedRpm(0U, 0.0f);
-        chassis_.setTargetSpeedRpm(1U, 0.0f);
-        chassis_.sendAllCurrent();
+        /* ---- 主履带：清零目标与输出，重置 PID ---- */
+        chassis_.clearOutput();
 
-        // 副履带 + 升降合并清零
-        subTrack_.setTargetSpeedRpm(0U, 0.0f);
-        subTrack_.setTargetSpeedRpm(1U, 0.0f);
-        subTrack_.calcOutput();
-        // 升降：保持当前目标位置（不更改 targetPosCnt_），输出由位置环产生
-        // 若需要失联时强制停止升降，可调用 lift_.syncTargetToCurrent()
+        /* ---- 副履带：清零目标与输出，重置 PID ---- */
+        subTrack_.clearOutput();
+
+        /* ---- 升降：保持原有目标位置（防止带负载下滑），重新计算输出 ---- */
+        // 若需要失联时强制锁定当前高度，可改为 lift_.syncTargetToCurrent()
         lift_.calcOutput();
 
-        int16_t outputs[4] = {
-            subTrack_.getTargetOutput(0U),
-            subTrack_.getTargetOutput(1U),
-            lift_.getTargetOutput(),
-            0};
-        DjiSendCanFrame(hcan2_, kSubTrackCmdId, outputs, 4U);
-
-        // Yaw 锁定
+        /* ---- Yaw：锁定当前角度，清零输出 ---- */
         yaw_.syncTargetToCurrent();
         targetYawDeg_ = yaw_.currentAngleDeg();
-        yaw_.sendZeroCurrent();
+        yaw_.clearOutput();
 
-        // DM 关节：纯阻尼保持当前位置
+        /* ---- DM 关节：纯阻尼保持当前位置 ---- */
         for (uint8_t i = 0U; i < kDmMotorCount; i++)
         {
             DmIndex idx = static_cast<DmIndex>(i);
@@ -295,16 +276,17 @@ void RobotController::faultStop()
             float holdDeg = (m != nullptr) ? m->feedback().angleDeg : 0.0f;
 
             joint_.setMitTarget(idx, holdDeg, 0.0f, 0.0f, 0.0f, 2.0f);
-            joint_.sendMitCommand(idx);
         }
 
-        // 折叠舵机：失联时不改变当前状态，避免盲目收起/展开
-        // servoCmd_.foldUs 保持不变
+        /* ---- 统一发送所有电机命令 ---- */
+        sendMotorCommands();
 
         state_ = RobotState::Standby;
     }
 
-uint32_t RobotController::clampPulse(uint32_t v, uint32_t minV, uint32_t maxV)
+    uint32_t RobotController::clampPulse(uint32_t v,
+                                         uint32_t minV,
+                                         uint32_t maxV)
     {
         if (v < minV)
             return minV;
@@ -313,14 +295,14 @@ uint32_t RobotController::clampPulse(uint32_t v, uint32_t minV, uint32_t maxV)
         return v;
     }
 
-float RobotController::applyDeadband(float v, float db)
+    float RobotController::applyDeadband(float v, float db)
     {
         if (v > -db && v < db)
             return 0.0f;
         return v;
     }
 
-float RobotController::clampF(float v, float lo, float hi)
+    float RobotController::clampF(float v, float lo, float hi)
     {
         if (v < lo)
             return lo;

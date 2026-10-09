@@ -10,8 +10,8 @@
  *
  * 注意：0x1FF 帧共4个slot（slot0~3），副履带占slot0~1，升降占slot2。
  *       三台 M2006 的命令必须合并在同一个 0x1FF 帧发出，否则后发的帧会
- *       覆盖先发的帧。合并逻辑在 RobotController::applyChassisMotors() 中
- *       统一组包，SubTrackMotorController 和 LiftMotorController 只负责
+ *       覆盖先发的帧。合并逻辑在 RobotController::sendMotorCommands() 中
+ *       统一组帧，SubTrackMotorController 和 LiftMotorController 只负责
  *       计算各自的目标电流，不独立发送 CAN 帧。
  */
 
@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include "pid.hpp"
 #include "stm32f4xx_hal.h"
 
@@ -34,7 +35,6 @@ namespace Robot
     inline constexpr uint32_t kSubTrackCmdId = 0x1FFU;
     inline constexpr uint32_t kSubTrackFeedbackBase = 0x205U;
 
-    // 升降 M2006：与副履带共用 0x1FF 命令帧，独立反馈 ID
     inline constexpr uint32_t kLiftFeedbackId = 0x207U;
 
     inline constexpr uint32_t kYawCmdId = 0x2FEU;
@@ -44,7 +44,7 @@ namespace Robot
     inline constexpr int16_t kM3508MaxCurrent = 16384;
     inline constexpr int16_t kM2006MaxCurrent = 10000;
     inline constexpr int16_t kGm6020MaxCurrent = 30000;
-    inline constexpr int16_t kLiftGravityFF = 500; ///< 升降重力补偿前馈电流，需实测标定（正=抵抗重力方向）
+    inline constexpr int16_t kLiftGravityFF = 500;
 
     inline constexpr uint32_t kDjiOfflineTimeoutMs = 100U;
 
@@ -117,11 +117,18 @@ namespace Robot
 
     /* ======================== CAN帧工具 ======================== */
 
+    /**
+     * @brief 将四路 int16_t 输出编码为 DJI 8字节协议帧并发送。
+     *        底层调用 BspCanSendStdFrame()。
+     */
     bool DjiSendCanFrame(CAN_HandleTypeDef *hcan,
                          uint32_t cmdId,
                          const int16_t *outputs,
                          uint8_t count);
 
+    /**
+     * @brief 整数域限幅（先转换再限幅，仅用于已知安全的整数值）。
+     */
     static inline int16_t DjiClampOutput(int16_t v, int16_t maxVal)
     {
         if (v > maxVal)
@@ -131,6 +138,24 @@ namespace Robot
         return v;
     }
 
+    /**
+     * @brief 浮点域检查、限幅，再转换为电机控制整数。
+     *        在浮点限幅后再转换，避免溢出或 NaN 转整数的未定义行为。
+     */
+    static inline int16_t DjiOutputFromFloat(float value, int16_t maxVal)
+    {
+        if (!std::isfinite(value) || maxVal <= 0)
+        {
+            return 0;
+        }
+        const float limit = static_cast<float>(maxVal);
+        if (value > limit)
+            value = limit;
+        if (value < -limit)
+            value = -limit;
+        return static_cast<int16_t>(value);
+    }
+
     /* ======================== M3508 主履带控制器 ======================== */
 
     class ChassisMotorController
@@ -138,7 +163,19 @@ namespace Robot
     public:
         void init(CAN_HandleTypeDef *hcan);
         void setTargetSpeedRpm(uint8_t idx, float rpm);
+
+        /// 只计算控制输出，不发送 CAN
+        void calcOutput();
+
+        /// 读取某台电机计算好的输出
+        int16_t getTargetOutput(uint8_t idx) const;
+
+        /// 清零目标、输出并重置 PID，不发送 CAN
+        void clearOutput();
+
+        /// 兼容接口：内部调用 calcOutput() 后发送，迁移完成后删除
         bool sendAllCurrent();
+
         void updateFeedback(uint32_t canId, const uint8_t *pData);
         void updateOnlineStatus();
         bool isAllOnline() const;
@@ -150,8 +187,6 @@ namespace Robot
     };
 
     /* ======================== M2006 副履带控制器 ======================== */
-    // 只计算电流，不独立发送 CAN 帧
-    // 外部通过 getTargetOutput() 读取后与升降合并发送
 
     class SubTrackMotorController
     {
@@ -162,8 +197,11 @@ namespace Robot
         /// 计算PID，更新 targetOutput，不发送CAN
         void calcOutput();
 
-        /// 清零两台电机的 PID 积分器（Standby 时调用，防止积分残留）
+        /// 清零 PID 积分器、目标和输出
         void resetPid();
+
+        /// 清零目标、输出并重置 PID，不发送 CAN
+        void clearOutput();
 
         int16_t getTargetOutput(uint8_t idx) const;
         const DjiMotorInstance *getInstance(uint8_t idx) const;
@@ -177,53 +215,36 @@ namespace Robot
     };
 
     /* ======================== M2006 升降控制器 ======================== */
-    /**
-     * @brief  夹爪升降电机控制器
-     *
-     * 位置闭环：
-     *   外环：位置误差 → 目标转速
-     *   内环：转速误差 → 电流（复用 speedPid）
-     *
-     * 位置单位：电机编码器累计 count（8192 count/圈）。
-     * 上电后以当前位置为零点；建议增加底部回零开关后再换算高度。
-     */
+
     class LiftMotorController
     {
     public:
         void init(CAN_HandleTypeDef *hcan);
 
-        /// 设置目标位置（编码器 count，正方向=上升，需实测确认）
         void setTargetPosition(float posCnt);
-
-        /// 获取当前反馈位置
         float currentPosition() const;
-
-        /// 摇杆输入更新目标（每次调用增减，摇杆回中时不变）
         void updateTargetByJoystick(float normalizedInput, float dtSeconds);
 
         /// 计算PID，更新 targetOutput，不发送CAN
         void calcOutput();
 
         int16_t getTargetOutput() const;
-
-        /// 是否接近安全折叠高度
         bool isSafeToFold(float safePos, float thresh) const;
 
         void updateFeedback(uint32_t canId, const uint8_t *pData);
         void updateOnlineStatus();
         bool isOnline() const;
 
-        /// 同步目标到当前位置（模式切换时防跳变）
         void syncTargetToCurrent();
 
     private:
         DjiMotorInstance motor_;
         CAN_HandleTypeDef *hcan_ = nullptr;
 
-        float targetPosCnt_ = 0.0f; ///< 目标位置（编码器count）
-        float posKp_ = 0.05f;       ///< 位置环比例增益，需实测
+        float targetPosCnt_ = 0.0f;
+        float posKp_ = 0.05f;
         float maxRpm_ = 800.0f;
-        float ratePerSec_ = 5000.0f; ///< 摇杆满偏时目标高度变化速率
+        float ratePerSec_ = 5000.0f;
     };
 
     /* ======================== GM6020 Yaw控制器 ======================== */
@@ -235,8 +256,22 @@ namespace Robot
         void setTargetAngleDeg(float angleDeg);
         void syncTargetToCurrent();
         float currentAngleDeg() const;
+
+        /// 只计算串级 PID，不发送 CAN
+        void calcOutput();
+
+        /// 读取计算好的控制输出
+        int16_t getTargetOutput() const;
+
+        /// 清零输出并重置 PID，不发送 CAN
+        void clearOutput();
+
+        /// 兼容接口：内部调用 calcOutput() 后发送，迁移完成后删除
         bool sendCurrent();
+
+        /// 兼容接口：内部调用 clearOutput() 后发送，迁移完成后删除
         bool sendZeroCurrent();
+
         void updateFeedback(uint32_t canId, const uint8_t *pData);
         void updateOnlineStatus();
         bool isOnline() const;

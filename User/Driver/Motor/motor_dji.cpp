@@ -4,11 +4,12 @@
  */
 
 #include "motor_dji.hpp"
+#include "bsp_can.hpp"
 #include <cstring>
 #include <cmath>
 
-extern volatile int16_t debugChTx201;
-extern volatile int16_t debugChTx202;
+// debugChTx201 / debugChTx202 的赋值已移至
+// communication.cpp 的 sendMotorCommands()，此处不再引用。
 
 namespace Robot
 {
@@ -73,7 +74,7 @@ namespace Robot
                         static_cast<int32_t>(lastEncodeRaw_);
         if (delta > 4096)
             roundCount_--;
-        else if (delta < -4096)
+        if (delta < -4096)
             roundCount_++;
 
         angleDeg_ = (static_cast<float>(newEncode) +
@@ -99,6 +100,7 @@ namespace Robot
 
     /* ================================================================
      * DjiSendCanFrame
+     * 负责 DJI 协议编码（int16_t → 8字节），底层调用 BspCanSendStdFrame
      * ================================================================ */
 
     bool DjiSendCanFrame(CAN_HandleTypeDef *hcan,
@@ -106,35 +108,20 @@ namespace Robot
                          const int16_t *outputs,
                          uint8_t count)
     {
-        if (hcan == nullptr || outputs == nullptr)
+        if (outputs == nullptr || count == 0U || count > 4U)
             return false;
 
-        // 等待空闲邮箱，超时 1 ms 放弃（同一总线高负载时保护）
-        uint32_t start = HAL_GetTick();
-        while (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U)
+        uint8_t txData[8] = {};
+
+        for (uint8_t i = 0U; i < count; ++i)
         {
-            if ((HAL_GetTick() - start) >= 1U)
-                return false;
+            // 用无符号位模式拆高低字节，避免有符号右移实现依赖
+            const uint16_t raw = static_cast<uint16_t>(outputs[i]);
+            txData[i * 2U] = static_cast<uint8_t>(raw >> 8U);
+            txData[i * 2U + 1U] = static_cast<uint8_t>(raw & 0xFFU);
         }
 
-        CAN_TxHeaderTypeDef txHeader{};
-        txHeader.StdId = cmdId;
-        txHeader.IDE = CAN_ID_STD;
-        txHeader.RTR = CAN_RTR_DATA;
-        txHeader.DLC = 8U;
-        txHeader.TransmitGlobalTime = DISABLE;
-
-        uint8_t txData[8] = {0U};
-        uint32_t mailbox = 0U;
-        uint8_t n = (count < 4U) ? count : 4U;
-
-        for (uint8_t i = 0U; i < n; i++)
-        {
-            txData[i * 2U] = static_cast<uint8_t>(outputs[i] >> 8);
-            txData[i * 2U + 1U] = static_cast<uint8_t>(outputs[i] & 0xFF);
-        }
-
-        return HAL_CAN_AddTxMessage(hcan, &txHeader, txData, &mailbox) == HAL_OK;
+        return BspCanSendStdFrame(hcan, cmdId, txData, 8U);
     }
 
     /* ================================================================
@@ -168,24 +155,66 @@ namespace Robot
         motors_[idx].targetSpeedRpm = rpm;
     }
 
-    bool ChassisMotorController::sendAllCurrent()
+    void ChassisMotorController::calcOutput()
     {
-        int16_t outputs[kChassisMotorCount];
-        for (uint8_t i = 0U; i < kChassisMotorCount; i++)
+        // 任意一台离线则两侧均禁止，避免单侧驱动导致意外转向
+        // if (!isAllOnline())
+        // {
+        //     clearOutput();
+        //     return;
+        // }
+
+        for (uint8_t i = 0U; i < kChassisMotorCount; ++i)
         {
-            float out = motors_[i].speedPid.update(
-                motors_[i].targetSpeedRpm,
-                static_cast<float>(motors_[i].feedback().speedRpm));
-            motors_[i].targetOutput = DjiClampOutput(
-                static_cast<int16_t>(out), kM3508MaxCurrent);
-            outputs[i] = motors_[i].targetOutput;
+            DjiMotorInstance &m = motors_[i];
+
+            if (!std::isfinite(m.targetSpeedRpm))
+            {
+                m.speedPid.reset();
+                m.targetOutput = 0;
+                continue;
+            }
+
+            const float out = m.speedPid.update(
+                m.targetSpeedRpm,
+                static_cast<float>(m.feedback().speedRpm));
+
+            m.targetOutput = DjiOutputFromFloat(out, kM3508MaxCurrent);
         }
-        debugChTx201 = outputs[0];
-        debugChTx202 = outputs[1];
-        return DjiSendCanFrame(hcan_, kChassisCmdId, outputs, kChassisMotorCount);
     }
 
-    void ChassisMotorController::updateFeedback(uint32_t canId, const uint8_t *pData)
+    int16_t ChassisMotorController::getTargetOutput(uint8_t idx) const
+    {
+        if (idx >= kChassisMotorCount)
+            return 0;
+        return motors_[idx].targetOutput;
+    }
+
+    void ChassisMotorController::clearOutput()
+    {
+        for (uint8_t i = 0U; i < kChassisMotorCount; ++i)
+        {
+            motors_[i].targetSpeedRpm = 0.0f;
+            motors_[i].targetOutput = 0;
+            motors_[i].speedPid.reset();
+        }
+    }
+
+    bool ChassisMotorController::sendAllCurrent()
+    {
+        calcOutput();
+
+        int16_t outputs[4] = {};
+        for (uint8_t i = 0U; i < kChassisMotorCount; ++i)
+        {
+            outputs[i] = getTargetOutput(i);
+        }
+
+        return DjiSendCanFrame(hcan_, kChassisCmdId, outputs, 4U);
+    }
+
+    void ChassisMotorController::updateFeedback(uint32_t canId,
+                                                const uint8_t *pData)
     {
         for (uint8_t i = 0U; i < kChassisMotorCount; i++)
         {
@@ -212,7 +241,8 @@ namespace Robot
         return true;
     }
 
-    const DjiMotorInstance *ChassisMotorController::getInstance(uint8_t idx) const
+    const DjiMotorInstance *ChassisMotorController::getInstance(
+        uint8_t idx) const
     {
         if (idx >= kChassisMotorCount)
             return nullptr;
@@ -221,7 +251,6 @@ namespace Robot
 
     /* ================================================================
      * SubTrackMotorController（M2006 副履带）
-     * 只计算 targetOutput，不独立发送 CAN 帧
      * ================================================================ */
 
     void SubTrackMotorController::init(CAN_HandleTypeDef *hcan)
@@ -253,13 +282,22 @@ namespace Robot
 
     void SubTrackMotorController::calcOutput()
     {
-        for (uint8_t i = 0U; i < kSubTrackMotorCount; i++)
+        for (uint8_t i = 0U; i < kSubTrackMotorCount; ++i)
         {
-            float out = motors_[i].speedPid.update(
-                motors_[i].targetSpeedRpm,
-                static_cast<float>(motors_[i].feedback().speedRpm));
-            motors_[i].targetOutput = DjiClampOutput(
-                static_cast<int16_t>(out), kM2006MaxCurrent);
+            DjiMotorInstance &m = motors_[i];
+
+            if (!m.isOnline() || !std::isfinite(m.targetSpeedRpm))
+            {
+                m.speedPid.reset();
+                m.targetOutput = 0;
+                continue;
+            }
+
+            const float out = m.speedPid.update(
+                m.targetSpeedRpm,
+                static_cast<float>(m.feedback().speedRpm));
+
+            m.targetOutput = DjiOutputFromFloat(out, kM2006MaxCurrent);
         }
     }
 
@@ -269,6 +307,16 @@ namespace Robot
             motors_[i].speedPid.reset();
     }
 
+    void SubTrackMotorController::clearOutput()
+    {
+        for (uint8_t i = 0U; i < kSubTrackMotorCount; ++i)
+        {
+            motors_[i].targetSpeedRpm = 0.0f;
+            motors_[i].targetOutput = 0;
+            motors_[i].speedPid.reset();
+        }
+    }
+
     int16_t SubTrackMotorController::getTargetOutput(uint8_t idx) const
     {
         if (idx >= kSubTrackMotorCount)
@@ -276,14 +324,16 @@ namespace Robot
         return motors_[idx].targetOutput;
     }
 
-    const DjiMotorInstance *SubTrackMotorController::getInstance(uint8_t idx) const
+    const DjiMotorInstance *SubTrackMotorController::getInstance(
+        uint8_t idx) const
     {
         if (idx >= kSubTrackMotorCount)
             return nullptr;
         return &motors_[idx];
     }
 
-    void SubTrackMotorController::updateFeedback(uint32_t canId, const uint8_t *pData)
+    void SubTrackMotorController::updateFeedback(uint32_t canId,
+                                                 const uint8_t *pData)
     {
         for (uint8_t i = 0U; i < kSubTrackMotorCount; i++)
         {
@@ -304,7 +354,6 @@ namespace Robot
 
     /* ================================================================
      * LiftMotorController（M2006 升降）
-     * 与副履带共用 0x1FF 命令帧的 slot2
      * ================================================================ */
 
     void LiftMotorController::init(CAN_HandleTypeDef *hcan)
@@ -319,7 +368,6 @@ namespace Robot
         speedCfg.integralLimit = 2000.0f;
         speedCfg.mode = PidMode::Position;
 
-        // 升降电机：反馈 0x207，命令帧 0x1FF，slot 2
         motor_.init(kLiftFeedbackId,
                     kSubTrackCmdId,
                     2U,
@@ -334,23 +382,19 @@ namespace Robot
 
     float LiftMotorController::currentPosition() const
     {
-        // 用多圈角度换算为编码器 count（1圈=8192 count，360°=8192 count）
-        // angleDeg_ 是相对上电零点的多圈度数
         return motor_.angleDeg() / 360.0f * 8192.0f;
     }
 
     void LiftMotorController::updateTargetByJoystick(float normalizedInput,
                                                      float dtSeconds)
     {
-        // 摇杆回中（normalizedInput≈0）时不更新目标，保持当前高度
         if (fabsf(normalizedInput) > 0.01f)
         {
             targetPosCnt_ += normalizedInput * ratePerSec_ * dtSeconds;
         }
-        // 目标限幅（此处使用示例范围，需按实际行程标定）
-        // 正方向为上升，需实测确认编码器方向
-        constexpr float kLiftPosMin = -20000.0f; // 需实测
-        constexpr float kLiftPosMax = 20000.0f;  // 需实测
+
+        constexpr float kLiftPosMin = -20000.0f;
+        constexpr float kLiftPosMax = 20000.0f;
         if (targetPosCnt_ < kLiftPosMin)
             targetPosCnt_ = kLiftPosMin;
         if (targetPosCnt_ > kLiftPosMax)
@@ -359,29 +403,47 @@ namespace Robot
 
     void LiftMotorController::calcOutput()
     {
-        // 外环：位置 → 目标转速
-        float posErr = targetPosCnt_ - currentPosition();
-
-        // 死区：误差小于 50 count 时只保持重力补偿，不运行 PID
-        if (fabsf(posErr) < 50.0f)
+        // 反馈离线时不继续使用旧反馈计算输出。
+        // 注意：清零电流不能保证垂直机构不下落，需有机械支撑/制动。
+        if (!motor_.isOnline())
         {
-            motor_.targetOutput = kLiftGravityFF;
+            motor_.targetOutput = 0;
             motor_.speedPid.reset();
             return;
         }
 
+        const float currentPos = currentPosition();
+
+        if (!std::isfinite(targetPosCnt_) ||
+            !std::isfinite(currentPos))
+        {
+            motor_.targetOutput = 0;
+            motor_.speedPid.reset();
+            return;
+        }
+
+        const float posErr = targetPosCnt_ - currentPos;
+
+        // 外环：位置误差转换为目标转子速度，单位 rpm。
         float targetRpm = posKp_ * posErr;
+
         if (targetRpm > maxRpm_)
             targetRpm = maxRpm_;
+
         if (targetRpm < -maxRpm_)
             targetRpm = -maxRpm_;
 
-        // 内环：转速 PID → 电流，叠加重力补偿前馈
-        float out = motor_.speedPid.update(
+        motor_.targetSpeedRpm = targetRpm;
+
+        // 内环：即使接近目标，也持续控制实际速度。
+        const float out = motor_.speedPid.update(
             targetRpm,
             static_cast<float>(motor_.feedback().speedRpm));
-        motor_.targetOutput = DjiClampOutput(
-            static_cast<int16_t>(out) + kLiftGravityFF, kM2006MaxCurrent);
+
+        // 重力前馈与闭环纠偏同时起作用。
+        motor_.targetOutput = DjiOutputFromFloat(
+            out + static_cast<float>(kLiftGravityFF),
+            kM2006MaxCurrent);
     }
 
     int16_t LiftMotorController::getTargetOutput() const
@@ -389,12 +451,14 @@ namespace Robot
         return motor_.targetOutput;
     }
 
-    bool LiftMotorController::isSafeToFold(float safePos, float thresh) const
+    bool LiftMotorController::isSafeToFold(float safePos,
+                                           float thresh) const
     {
         return fabsf(currentPosition() - safePos) <= thresh;
     }
 
-    void LiftMotorController::updateFeedback(uint32_t canId, const uint8_t *pData)
+    void LiftMotorController::updateFeedback(uint32_t canId,
+                                             const uint8_t *pData)
     {
         if (motor_.feedbackId() == canId)
         {
@@ -459,24 +523,45 @@ namespace Robot
         motor_.posPid.reset();
     }
 
-    bool YawMotorController::sendCurrent()
+    void YawMotorController::calcOutput()
     {
-        if (!motor_.isOnline())
+        if (!motor_.isOnline() || !std::isfinite(targetAngleDeg_))
         {
-            motor_.targetOutput = 0;
-            const int16_t outputs[4] = {0};
-            return DjiSendCanFrame(hcan_, kYawCmdId, outputs, 4U);
+            clearOutput();
+            return;
         }
         runCascadePid();
-        int16_t outputs[4] = {0};
-        outputs[kYawSlot] = DjiClampOutput(motor_.targetOutput, kGm6020MaxCurrent);
+    }
+
+    int16_t YawMotorController::getTargetOutput() const
+    {
+        return motor_.targetOutput;
+    }
+
+    void YawMotorController::clearOutput()
+    {
+        motor_.targetOutput = 0;
+        motor_.speedPid.reset();
+        motor_.posPid.reset();
+    }
+
+    // 兼容接口：迁移完成后删除
+    bool YawMotorController::sendCurrent()
+    {
+        calcOutput();
+
+        int16_t outputs[4] = {};
+        outputs[kYawSlot] = getTargetOutput();
+
         return DjiSendCanFrame(hcan_, kYawCmdId, outputs, 4U);
     }
 
+    // 兼容接口：迁移完成后删除
     bool YawMotorController::sendZeroCurrent()
     {
-        motor_.targetOutput = 0;
-        const int16_t outputs[4] = {0};
+        clearOutput();
+
+        const int16_t outputs[4] = {};
         return DjiSendCanFrame(hcan_, kYawCmdId, outputs, 4U);
     }
 
@@ -485,7 +570,8 @@ namespace Robot
         return motor_.angleDeg();
     }
 
-    void YawMotorController::updateFeedback(uint32_t canId, const uint8_t *pData)
+    void YawMotorController::updateFeedback(uint32_t canId,
+                                            const uint8_t *pData)
     {
         if (motor_.feedbackId() == canId)
             motor_.updateFeedback(pData);
@@ -504,19 +590,22 @@ namespace Robot
     void YawMotorController::runCascadePid()
     {
         constexpr float kDeadband = 1.0f;
-        float err = targetAngleDeg_ - motor_.angleDeg();
+        const float err = targetAngleDeg_ - motor_.angleDeg();
+
         if (fabsf(err) < kDeadband)
         {
-            motor_.targetOutput = 0;
-            motor_.speedPid.reset();
-            motor_.posPid.reset();
+            clearOutput();
             return;
         }
-        float targetRpm = motor_.posPid.update(targetAngleDeg_, motor_.angleDeg());
-        float out = motor_.speedPid.update(
-            targetRpm, static_cast<float>(motor_.feedback().speedRpm));
-        motor_.targetOutput = DjiClampOutput(
-            static_cast<int16_t>(out), kGm6020MaxCurrent);
+
+        const float targetRpm = motor_.posPid.update(
+            targetAngleDeg_, motor_.angleDeg());
+
+        const float out = motor_.speedPid.update(
+            targetRpm,
+            static_cast<float>(motor_.feedback().speedRpm));
+
+        motor_.targetOutput = DjiOutputFromFloat(out, kGm6020MaxCurrent);
     }
 
 } // namespace Robot

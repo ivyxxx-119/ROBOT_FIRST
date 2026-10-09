@@ -38,6 +38,7 @@ set(USER_SOURCES
     # BSP
     "${USER_DIR}/Bsp/bsp_delay.cpp"
     "${USER_DIR}/Bsp/bsp_bmi088.cpp"
+    "${USER_DIR}/Bsp/bsp_can.cpp"
 
     # Drivers
     "${USER_DIR}/Driver/Sensor/bmi088.cpp"
